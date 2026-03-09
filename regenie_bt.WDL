@@ -20,6 +20,7 @@ workflow regenie_bt {
         Int step2_block_size = 250
         Boolean concatenate_into_parquet = false
         Boolean fix_step2_header_for_rap = true
+        Boolean step2_strict = false
     }
 
     Array[Array[String]] step2_chunks = read_tsv(step2_chunk_manifest)
@@ -103,6 +104,7 @@ workflow regenie_bt {
                 minMAC = minMAC,
                 threads = threads,
                 fix_step2_header_for_rap = fix_step2_header_for_rap,
+                step2_strict = step2_strict,
                 phenotypes = phenotypes
         }
     }
@@ -343,6 +345,7 @@ task step2 {
         Int minMAC
         Int threads
         Boolean fix_step2_header_for_rap
+        Boolean step2_strict
     }
 
     command <<<
@@ -391,13 +394,28 @@ task step2 {
 
         unzip ~{plink2_binary}  
 
-        ./plink2 --pfile ~{plink2_prefix} \
-            --from-bp ~{start} \
-            --to-bp ~{end} \
-            --chr ~{chrom} \ 
-            --mac ~{minMAC} \
-            --make-pgen \
-            --out ~{plink2_prefix}.filtered
+        if [[ "~{step2_strict}" == "true" ]]; then
+            ./plink2 --pfile ~{plink2_prefix} \
+                --from-bp ~{start} \
+                --to-bp ~{end} \
+                --chr ~{chrom} \ 
+                --mac ~{minMAC} \
+                --snps-only \
+                --var-filter \
+                --min-alleles 2 \
+                --max-alleles 2 \
+                --geno 0.05 \
+                --make-pgen \
+                --out ~{plink2_prefix}.filtered
+        else 
+            ./plink2 --pfile ~{plink2_prefix} \
+                --from-bp ~{start} \
+                --to-bp ~{end} \
+                --chr ~{chrom} \ 
+                --mac ~{minMAC} \
+                --make-pgen \
+                --out ~{plink2_prefix}.filtered
+        fi
 
         ls -alh 
         echo "$(date -u) Done filtering with plink2; now running regenie"
