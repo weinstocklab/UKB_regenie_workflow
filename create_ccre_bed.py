@@ -126,8 +126,8 @@ def load_cell_type(
         CREATE TABLE {table} AS
         SELECT
             "#chr"                AS chrom,
-            CAST(start AS INT)    AS start,
-            CAST(end   AS INT)    AS end,
+            CAST("start" AS INT)  AS start,
+            CAST("end"   AS INT)  AS end,
             TargetGene            AS gene,
             '{category}'          AS category
         FROM read_csv(
@@ -183,7 +183,7 @@ def main():
 
     # Union all cell types
     union_sql = " UNION ALL ".join(
-        f"SELECT chrom, start, end, gene, category FROM ct_{label}"
+        f'SELECT chrom, "start", "end", gene, category FROM ct_{label}'
         for label, _ in args.cell_types
     )
     con.execute(f"CREATE TABLE blood_ccre AS {union_sql}")
@@ -225,7 +225,7 @@ def main():
                 SELECT b.chrom, b.gene
                 FROM blood_ccre b
                 JOIN tss t ON b.chrom = t.chrom AND b.gene = t.gene
-                WHERE ABS((b.start + b.end) / 2 - t.tss_pos) > {args.distance_cap}
+                WHERE ABS((b."start" + b."end") / 2 - t.tss_pos) > {args.distance_cap}
             )
         """)
         after = con.execute("SELECT COUNT(*) FROM blood_ccre").fetchone()[0]
@@ -235,9 +235,9 @@ def main():
     # Enhancer width summary
     row = con.execute("""
         SELECT
-            ROUND(MEDIAN(end - start), 0) AS median_width,
-            MIN(end - start)              AS min_width,
-            MAX(end - start)              AS max_width
+            ROUND(MEDIAN("end" - "start"), 0) AS median_width,
+            MIN("end" - "start")              AS min_width,
+            MAX("end" - "start")              AS max_width
         FROM blood_ccre
     """).fetchone()
     median_w, min_w, max_w = row
@@ -248,9 +248,9 @@ def main():
     print(f"\nWriting: {args.out}")
     con.execute(f"""
         COPY (
-            SELECT chrom, start, end, gene, category
+            SELECT chrom, "start", "end", gene, category
             FROM blood_ccre
-            ORDER BY chrom, start, end, gene, category
+            ORDER BY chrom, "start", "end", gene, category
         ) TO '{args.out}' (DELIMITER '\t', HEADER false)
     """)
     print(

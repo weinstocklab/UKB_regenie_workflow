@@ -74,6 +74,7 @@ workflow ccre_anno {
 #
 # For one chromosome: stream the pvar file, filter to positions that fall
 # within a cCRE interval, and write variant_id/gene/category rows.
+# Uses DuckDB CLI directly (no Python in this image).
 # ---------------------------------------------------------------------------
 task annotate_chrom {
 
@@ -87,84 +88,59 @@ task annotate_chrom {
     command <<<
         echo "$(date -u) annotate_chrom ~{chrom_with_prefix} start"
 
-        python3 << 'PYEOF'
-import duckdb, sys
+        # Extract first 5 pvar columns (CHROM,POS,ID,REF,ALT) to a local CSV.
+        # This bypasses DuckDB's sniffer and avoids reading the INFO column.
+        awk '!/^#/{OFS=","; print $1,$2,$3,$4,$5}' ~{pvar} > pvar_5col.csv
+        echo "pvar columns extracted"
 
-pvar_path         = "~{pvar}"
-ccre_path         = "~{ccre_bed}"
-chrom_with_prefix = "~{chrom_with_prefix}"
-prefix            = "~{variant_id_prefix}"
-out_path          = "chrom_" + chrom_with_prefix + "_ccre_anno.tsv"
+        # Extract cCRE intervals for this chromosome, sorted by start position.
+        # Result is tiny: typically <10k rows.
+        awk -v chrom="~{chrom_with_prefix}" '$1==chrom{print $2"\t"$3"\t"$4"\t"$5}' \
+            ~{ccre_bed} | sort -k1,1n > chr_ccre.bed
+        n_ccre=$(wc -l < chr_ccre.bed)
+        echo "n_ccre=${n_ccre}"
 
-con = duckdb.connect()
+        # Sweep-line interval join: O(n_pvar + n_ccre) time, O(n_ccre) memory.
+        # Loads chr_ccre.bed into arrays (NR==FNR pass), then streams pvar_5col.csv.
+        # Both inputs are sorted by position; lo pointer skips expired intervals.
+        # Outputs comma-separated variant_id,gene,category (no spaces in any field).
+        awk -v prefix="~{variant_id_prefix}" -v chrom="~{chrom_with_prefix}" '
+        BEGIN { lo = 1; n = 0 }
+        NR==FNR {
+            n++
+            s[n] = $1 + 0
+            e[n] = $2 + 0
+            g[n] = $3
+            c[n] = $4
+            next
+        }
+        {
+            split($0, f, ",")
+            pos = f[2] + 0
+            vid = prefix ":" chrom ":" f[2] ":" f[4] ":" f[5]
+            for (i = lo; i <= n; i++) {
+                if (s[i] > pos) break
+                if (e[i] > pos) print vid "," g[i] "," c[i]
+            }
+            while (lo <= n && e[lo] <= pos) lo++
+        }
+        ' chr_ccre.bed pvar_5col.csv | sort -u > anno_rows.csv
 
-# pvar: lines starting with '#' are comments/header; positional columns
-# column0=CHROM, column1=POS, column2=ID, column3=REF, column4=ALT
-con.execute(f"""
-    CREATE TABLE pvar AS
-    SELECT
-        '{prefix}' || ':' || column0 || ':' || CAST(column1 AS VARCHAR)
-            || ':' || column3 || ':' || column4  AS variant_id,
-        column0                                  AS chrom,
-        CAST(column1 AS INTEGER)                 AS pos
-    FROM read_csv(
-        '{pvar_path}',
-        delim   = '\t',
-        comment = '#',
-        header  = false,
-        columns = {{
-            'column0': 'VARCHAR',
-            'column1': 'INTEGER',
-            'column2': 'VARCHAR',
-            'column3': 'VARCHAR',
-            'column4': 'VARCHAR'
-        }}
-    )
-""")
+        n_anno=$(wc -l < anno_rows.csv)
+        echo "n_anno=${n_anno}"
 
-# Load only the cCRE intervals for this chromosome
-con.execute(f"""
-    CREATE TABLE ccre AS
-    SELECT
-        CAST(column1 AS INT) AS start,
-        CAST(column2 AS INT) AS end,
-        column3              AS gene,
-        column4              AS category
-    FROM read_csv(
-        '{ccre_path}',
-        delim   = '\t',
-        header  = false,
-        columns = {{
-            'column0': 'VARCHAR',
-            'column1': 'INTEGER',
-            'column2': 'INTEGER',
-            'column3': 'VARCHAR',
-            'column4': 'VARCHAR'
-        }}
-    )
-    WHERE column0 = '{chrom_with_prefix}'
-""")
+        # Write anno_rows.csv to parquet via DuckDB (small file, no join needed).
+        duckdb -c "
+        COPY (
+            SELECT column0 AS variant_id, column1 AS gene, column2 AS category
+            FROM read_csv('anno_rows.csv', delim=',', header=false,
+                          columns={'column0':'VARCHAR','column1':'VARCHAR','column2':'VARCHAR'})
+        ) TO 'chrom_~{chrom_with_prefix}_ccre_anno.parquet' (FORMAT PARQUET)
+        " || { echo "ERROR: parquet write failed for ~{chrom_with_prefix}"; exit 1; }
 
-n_pvar = con.execute("SELECT COUNT(*) FROM pvar").fetchone()[0]
-n_ccre = con.execute("SELECT COUNT(*) FROM ccre").fetchone()[0]
-print(f"{chrom_with_prefix}: {n_pvar:,} pvar variants, {n_ccre:,} cCRE intervals",
-      flush=True)
-
-# Interval join: variant position within [start, end)
-con.execute(f"""
-    COPY (
-        SELECT DISTINCT p.variant_id, c.gene, c.category
-        FROM pvar p
-        JOIN ccre c ON p.pos >= c.start AND p.pos < c.end
-        ORDER BY c.gene, p.variant_id
-    ) TO '{out_path}' (DELIMITER '\t', HEADER false)
-""")
-
-n_out = con.execute(
-    f"SELECT COUNT(*) FROM read_csv('{out_path}', header=false, columns={{'column0':'VARCHAR','column1':'VARCHAR','column2':'VARCHAR'}})"
-).fetchone()[0]
-print(f"{chrom_with_prefix}: {n_out:,} variant-gene annotations -> {out_path}", flush=True)
-PYEOF
+        # Verify the output parquet is valid.
+        duckdb -c "SELECT COUNT(*) AS n_anno FROM parquet_scan('chrom_~{chrom_with_prefix}_ccre_anno.parquet')" \
+            || { echo "ERROR: parquet validation failed for ~{chrom_with_prefix}"; exit 1; }
 
         echo "$(date -u) annotate_chrom ~{chrom_with_prefix} done"
     >>>
@@ -187,7 +163,7 @@ PYEOF
     }
 
     output {
-        File chrom_anno_tsv = "chrom_" + chrom_with_prefix + "_ccre_anno.tsv"
+        File chrom_anno_tsv = "chrom_" + chrom_with_prefix + "_ccre_anno.parquet"
     }
 
 }
@@ -198,6 +174,7 @@ PYEOF
 #
 # Merge per-chromosome annotation TSVs and write the three REGENIE gene-based
 # annotation files: anno_file.tsv, set_list.tsv, mask_def.tsv.
+# Uses DuckDB CLI directly (no Python in this image).
 # ---------------------------------------------------------------------------
 task concatenate_anno {
 
@@ -208,82 +185,58 @@ task concatenate_anno {
     command <<<
         echo "$(date -u) concatenate_anno start"
 
+        # Build a DuckDB-format quoted file path list for read_parquet()
+        FILES=""
         for f in ~{sep=' ' chrom_anno_files}; do
-            ln -s "$f" .
+            [ -z "$FILES" ] && FILES="'$f'" || FILES="$FILES, '$f'"
         done
 
-        python3 << 'PYEOF'
-import duckdb
+        mkdir -p /tmp/duckdb_spill
 
-con = duckdb.connect()
+        duckdb << DUCKEOF
+-- Cap DuckDB at 12 GB; spill to SSD rather than OOM.
+SET memory_limit = '12GB';
+SET temp_directory = '/tmp/duckdb_spill';
 
-# Union all per-chromosome annotation files
-con.execute("""
-    CREATE TABLE anno AS
-    SELECT column0 AS variant_id, column1 AS gene, column2 AS category
-    FROM read_csv(
-        '*_ccre_anno.tsv',
-        delim   = '\t',
-        header  = false,
-        columns = {'column0': 'VARCHAR', 'column1': 'VARCHAR', 'column2': 'VARCHAR'}
-    )
-""")
+SELECT COUNT(*) AS n_rows, COUNT(DISTINCT gene) AS n_genes
+FROM read_parquet([$FILES]);
 
-n = con.execute("SELECT COUNT(*) FROM anno").fetchone()[0]
-n_genes = con.execute("SELECT COUNT(DISTINCT gene) FROM anno").fetchone()[0]
-print(f"Loaded {n:,} variant-gene annotations across {n_genes:,} genes", flush=True)
+-- anno_file.tsv: variant_id  gene  category
+-- Read parquet directly (no intermediate table) to avoid double-materialising.
+COPY (
+    SELECT DISTINCT variant_id, gene, category
+    FROM read_parquet([$FILES])
+    ORDER BY gene, variant_id, category
+) TO 'anno_file.tsv' (DELIMITER ' ', HEADER false);
 
-# --- anno_file.tsv: variant_id  gene  category ---
-con.execute("""
-    COPY (
-        SELECT variant_id, gene, category
-        FROM anno
-        ORDER BY gene, variant_id, category
-    ) TO 'anno_file.tsv' (DELIMITER '\t', HEADER false)
-""")
-print(f"Written: anno_file.tsv  ({n:,} rows)", flush=True)
-
-# --- set_list.tsv: gene  chrom  start_pos  variant_list ---
-# Variant ID format: PREFIX:CHROM:POS:REF:ALT  (split_part is 1-based)
-con.execute("""
-    CREATE TABLE set_list_tbl AS
+-- set_list.tsv: gene  chrom  start_pos  variant_list
+COPY (
     SELECT
         gene,
         split_part(variant_id, ':', 2)                       AS chrom,
         MIN(CAST(split_part(variant_id, ':', 3) AS INTEGER)) AS start_pos,
         string_agg(DISTINCT variant_id, ',')                 AS variant_list
-    FROM anno
+    FROM read_parquet([$FILES])
     GROUP BY gene, split_part(variant_id, ':', 2)
-""")
-n_sets = con.execute("SELECT COUNT(*) FROM set_list_tbl").fetchone()[0]
-con.execute("""
-    COPY (
-        SELECT gene, chrom, start_pos, variant_list
-        FROM set_list_tbl
-        ORDER BY chrom, start_pos
-    ) TO 'set_list.tsv' (DELIMITER '\t', HEADER false)
-""")
-print(f"Written: set_list.tsv  ({n_sets:,} genes)", flush=True)
+    ORDER BY chrom, start_pos
+) TO 'set_list.tsv' (DELIMITER ' ', HEADER false);
 
-# --- mask_def.tsv: mask_name  annotation_categories ---
-# Discover categories dynamically so this task works for any cCRE category set
-cats = con.execute(
-    "SELECT DISTINCT category FROM anno ORDER BY category"
-).fetchall()
-with open("mask_def.tsv", "w") as fh:
-    for (cat,) in cats:
-        fh.write(f"M_{cat}\t{cat}\n")
-print(f"Written: mask_def.tsv  ({len(cats)} mask(s))", flush=True)
-for (cat,) in cats:
-    print(f"  M_{cat}  {cat}", flush=True)
-PYEOF
+-- mask_def.tsv: mask_name  category (one mask per cell type, discovered dynamically)
+COPY (
+    SELECT 'M_' || category AS mask_name, category
+    FROM (SELECT DISTINCT category FROM read_parquet([$FILES]) ORDER BY category)
+) TO 'mask_def.tsv' (DELIMITER ' ', HEADER false);
+
+SELECT mask_name, category FROM read_csv('mask_def.tsv', delim=' ', header=false,
+    columns={'mask_name':'VARCHAR','category':'VARCHAR'});
+DUCKEOF
 
         echo "$(date -u) concatenate_anno done"
     >>>
 
     runtime {
         docker: "jweinstk/duckdb:master"
-        dx_instance_type: "mem2_ssd1_v2_x2"
+        dx_instance_type: "mem2_ssd1_v2_x4"
     }
 
     output {

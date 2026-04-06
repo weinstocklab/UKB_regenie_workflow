@@ -35,10 +35,15 @@ Gene assignment (choose one, in priority order):
 
 Multiple thresholds:
   Each threshold creates an annotation category AM_<threshold> (e.g. AM_0p34 for 0.34).
-  A variant with score 0.7 and thresholds [0.34, 0.564] gets two anno_file rows:
-    chr1-xxx  GENE  AM_0p34
-    chr1-xxx  GENE  AM_0p564
-  Masks then reference the category at the desired cutoff.
+  Each (variant, gene) pair is assigned exactly ONE category — the strictest threshold
+  it qualifies for (REGENIE requires at most one annotation per variant-gene pair).
+  A variant with score 0.7 and thresholds [0.34, 0.564] gets one anno_file row:
+    chr1-xxx  GENE  AM_0p564      ← strictest passing threshold
+  A variant with score 0.45 gets:
+    chr1-xxx  GENE  AM_0p34       ← only threshold it passes
+  Masks include all categories at and above the threshold:
+    M_AM_0p34     AM_0p34,AM_0p564    ← captures score >= 0.34
+    M_AM_0p564    AM_0p564            ← captures score >= 0.564
 
   Known AlphaMissense category boundaries (from this file):
     likely_benign     : AM < 0.34
@@ -281,17 +286,17 @@ def build_am_annotations(con, thresholds: list[float]) -> int:
         SELECT * FROM (VALUES {values_rows}) t(threshold, category)
     """)
 
-    # Cross join: each (variant, gene) gets a row for every threshold it surpasses
+    # Assign each (variant, gene) exactly ONE category: the strictest threshold passed.
+    # REGENIE requires at most one annotation per (variant, gene) pair.
+    # Masks then aggregate categories: M_AM_0p34 = AM_0p34,AM_0p564 to capture both bins.
     con.execute(f"""
         CREATE OR REPLACE TABLE am_anno AS
-        SELECT
-            a.variant_id,
-            a.gene,
-            t.category
+        SELECT a.variant_id, a.gene, t.category
         FROM am_by_gene a
         CROSS JOIN thresh_table t
         WHERE a.max_score >= t.threshold
           AND a.max_score >= {min_thresh}
+        QUALIFY t.threshold = MAX(t.threshold) OVER (PARTITION BY a.variant_id, a.gene)
     """)
     n = con.execute("SELECT COUNT(*) FROM am_anno").fetchone()[0]
 
@@ -312,7 +317,7 @@ def load_plof(con, plof_path: str) -> int:
     print(f"\nLoading pLoF annotations: {plof_path}")
     con.execute(f"""
         CREATE OR REPLACE TABLE plof AS
-        SELECT
+        SELECT DISTINCT
             column0 AS variant_id,
             column1 AS gene,
             'pLoF'  AS category
@@ -369,7 +374,7 @@ def write_anno_file(con, out_dir: str):
     n = con.execute("SELECT COUNT(*) FROM anno").fetchone()[0]
     con.execute(f"""
         COPY (
-            SELECT variant_id, gene, category
+            SELECT DISTINCT variant_id, gene, category
             FROM anno
             ORDER BY gene, variant_id, category
         ) TO '{path}' (DELIMITER '\t', HEADER false)
@@ -385,11 +390,11 @@ def write_set_list(con, out_dir: str):
         CREATE OR REPLACE TABLE set_list_tbl AS
         SELECT
             gene,
-            split_part(variant_id, ':', 2) AS chrom,
+            regexp_replace(split_part(variant_id, ':', 2), '^chr', '') AS chrom,
             MIN(CAST(split_part(variant_id, ':', 3) AS INTEGER)) AS start_pos,
             string_agg(DISTINCT variant_id, ',') AS variant_list
         FROM anno
-        GROUP BY gene, split_part(variant_id, ':', 2)
+        GROUP BY gene, regexp_replace(split_part(variant_id, ':', 2), '^chr', '')
     """)
     n = con.execute("SELECT COUNT(*) FROM set_list_tbl").fetchone()[0]
     path = f"{out_dir}/set_list.tsv"
@@ -397,10 +402,17 @@ def write_set_list(con, out_dir: str):
         COPY (
             SELECT gene, chrom, start_pos, variant_list
             FROM set_list_tbl
-            ORDER BY chrom, start_pos
+            WHERE TRY_CAST(chrom AS INTEGER) BETWEEN 1 AND 22
+            ORDER BY CAST(chrom AS INTEGER), start_pos
         ) TO '{path}' (DELIMITER '\t', HEADER false)
     """)
-    print(f"Written: {path}  ({n:,} genes/sets)")
+    n_written = con.execute(
+        "SELECT COUNT(*) FROM set_list_tbl WHERE TRY_CAST(chrom AS INTEGER) BETWEEN 1 AND 22"
+    ).fetchone()[0]
+    n_skipped = n - n_written
+    if n_skipped > 0:
+        print(f"  Skipped {n_skipped:,} non-autosomal gene/chrom entries (X, Y, M, etc.)")
+    print(f"Written: {path}  ({n_written:,} autosomal genes/sets)")
 
 
 def write_mask_def(thresholds: list[float], has_plof: bool, out_dir: str):
@@ -411,13 +423,18 @@ def write_mask_def(thresholds: list[float], has_plof: bool, out_dir: str):
     thresholds_asc = sorted(thresholds)
     cats = [f"AM_{threshold_to_name(t)}" for t in thresholds_asc]
 
+    # For each threshold, the mask includes that category AND all stricter (higher) ones,
+    # because stricter-threshold variants are binned into the stricter category only.
+    # e.g. M_AM_0p34 = AM_0p34,AM_0p564 captures all variants with score >= 0.34.
     masks = []
     if has_plof:
         masks.append(("M_pLoF", "pLoF"))
-        for cat in cats:
-            masks.append((f"M_pLoF_{cat}", f"pLoF,{cat}"))
-    for cat in cats:
-        masks.append((f"M_{cat}", cat))
+        for i, cat in enumerate(cats):
+            included = "pLoF," + ",".join(cats[i:])
+            masks.append((f"M_pLoF_{cat}", included))
+    for i, cat in enumerate(cats):
+        included = ",".join(cats[i:])
+        masks.append((f"M_{cat}", included))
 
     path = f"{out_dir}/mask_def.tsv"
     with open(path, "w") as f:
