@@ -33,7 +33,7 @@ workflow regenie_gene_bt {
 
         # Step 2 parameters
         Int step2_block_size = 250
-        Int min_mac = 1          # min MAC for plink2 pre-filter
+        Int min_mac = 2          # min MAC for plink2 pre-filter (excludes singletons)
         Float max_maf = 0.01     # max MAF for plink2 pre-filter (retains rare variants)
 
         # Gene-based test parameters
@@ -428,7 +428,7 @@ task step2 {
         # Keep rare variants for gene-based tests (no snps-only: retain indels/PTVs)
         ./plink2 --pfile ~{plink2_prefix} \
             --chr ~{chrom} \
-            --max-freq ~{max_maf} \
+            --max-maf ~{max_maf} \
             --mac ~{min_mac} \
             --make-pgen \
             --out ~{plink2_prefix}.filtered
@@ -510,24 +510,26 @@ task concatenate {
          (SELECT
              concat('chr', CHROM) AS CHROM,
              GENPOS AS POS,
-             NAME,
+             ID,
              ALLELE0,
              ALLELE1,
              A1FREQ,
-             A1FREQ_CASES,
-             A1FREQ_CONTROLS,
              N,
-             N_CASES,
-             N_CONTROLS,
+             TEST,
              BETA,
              SE,
              CHISQ,
              LOG10P,
-             replace(split_part(filename, '_', 3), '.regenie.gz', '') AS phenotype
+             EXTRA,
+             replace(regexp_replace(filename, '^.*chrom_[0-9]+_', ''), '.regenie.gz', '') AS phenotype
              FROM read_csv('*.gz',
                 sep = ' ',
+                comment = '#',
                 filename = true,
-                types={'ALLELE0': 'VARCHAR', 'ALLELE1': 'VARCHAR', 'NAME': 'VARCHAR'},
+                nullstr = 'NA',
+                union_by_name = true,
+                types={'ALLELE0': 'VARCHAR', 'ALLELE1': 'VARCHAR', 'ID': 'VARCHAR', 'EXTRA': 'VARCHAR',
+                       'A1FREQ': 'DOUBLE', 'BETA': 'DOUBLE', 'SE': 'DOUBLE'},
                 ignore_errors = true
             )
          )
